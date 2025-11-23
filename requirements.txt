@@ -2,3 +2,6 @@ fastapi
 uvicorn
 pdfminer.six
 python-multipart
+python-docx
+requests
+beautifulsoup4
