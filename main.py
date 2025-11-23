@@ -4,14 +4,17 @@ from pydantic import BaseModel
 from typing import List
 import io
 import re
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 from pdfminer.high_level import extract_text as pdf_extract_text
+from docx import Document
+import requests
+from bs4 import BeautifulSoup
 
 app = FastAPI(
     title="JobMatch Assistant",
-    description="Outil privé d'analyse de CV et de génération de recherches d'offres d'emploi.",
-    version="3.0.0"
+    description="Analyse ton CV et trouve de vraies offres Indeed adaptées à ton profil.",
+    version="4.0.0"
 )
 
 app.add_middleware(
@@ -31,7 +34,7 @@ class JobOffer(BaseModel):
     source: str
     match_score: float
     snippet: str
-    published_at: str | None  # on garde le champ pour plus tard, mais on ne l'affiche plus
+    published_at: str | None  # texte brut, ex: "il y a 2 jours"
     is_paid: bool
     salary_text: str | None
 
@@ -45,23 +48,7 @@ class ContactRequest(BaseModel):
     cv_summary: str
 
 
-# ---------- Utils CV ----------
-
-def extract_text_from_upload(upload: UploadFile) -> str:
-    content = upload.file.read()
-    filename = (upload.filename or "").lower()
-
-    if filename.endswith(".pdf"):
-        try:
-            return pdf_extract_text(io.BytesIO(content))
-        except Exception as e:
-            raise HTTPException(status_code=400, detail=f"Erreur lecture PDF: {str(e)}")
-
-    try:
-        return content.decode("utf-8", errors="ignore")
-    except Exception:
-        return content.decode(errors="ignore")
-
+# ----------------- Utils CV -----------------
 
 STOPWORDS = {
     "je", "nous", "vous", "ils", "elles", "le", "la", "les", "des", "de", "du", "un", "une",
@@ -72,43 +59,41 @@ STOPWORDS = {
 }
 
 
+def extract_text_from_upload(upload: UploadFile) -> str:
+    content = upload.file.read()
+    filename = (upload.filename or "").lower()
+
+    # PDF
+    if filename.endswith(".pdf"):
+        try:
+            return pdf_extract_text(io.BytesIO(content))
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Erreur lecture PDF: {str(e)}")
+
+    # DOCX
+    if filename.endswith(".docx"):
+        try:
+            file_like = io.BytesIO(content)
+            document = Document(file_like)
+            return "\n".join(p.text for p in document.paragraphs)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Erreur lecture DOCX: {str(e)}")
+
+    # Autres (DOC, TXT, etc.) -> tentative de décodage
+    try:
+        return content.decode("utf-8", errors="ignore")
+    except Exception:
+        return content.decode(errors="ignore")
+
+
 def extract_profile(cv_text: str) -> dict:
     """
-    Analyse générique : on essaye de récupérer des titres de poste et des mots-clés
-    quelle que soit la spécialité (IT, logistique, banque, retail, santé, etc.)
+    Analyse générique : on récupère des mots-clés fréquents + on devine un "titre"
+    à partir des lignes les plus typiques d'un CV.
     """
     text = cv_text
 
-    # 1) Détecter des "lignes titres" (avec mots comme technicien, agent, analyste, etc.)
-    title_keywords = [
-        "technicien", "technicienne", "agent", "agente", "analyste", "ingénieur", "ingenieur",
-        "développeur", "developpeur", "développeuse", "assistant", "assistante",
-        "conseiller", "conseillère", "representant", "représentant", "représentante",
-        "gestionnaire", "superviseur", "superviseure", "responsable",
-        "préposé", "préposée", "caissier", "caissière", "vendeur", "vendeuse",
-        "chauffeur", "livreur", "préparateur", "préparatrice", "magasinier",
-        "comptable", "infirmier", "infirmière", "administrateur", "administratrice",
-        "coordonateur", "coordonnateur", "coordonnatrice"
-    ]
-
-    lines = [l.strip() for l in text.splitlines() if l.strip()]
-    found_titles: list[str] = []
-
-    for line in lines:
-        lower = line.lower()
-        if any(k in lower for k in title_keywords):
-            # On garde la ligne complète comme "titre" potentiel
-            if 4 <= len(line) <= 120:
-                found_titles.append(line)
-
-    # Nettoyage doublons
-    titles = list(dict.fromkeys(found_titles))
-
-    if not titles:
-        # fallback très général
-        titles = ["candidat expérimenté", "professionnel polyvalent"]
-
-    # 2) Extraire des mots-clés fréquents dans le CV
+    # 1) Mots-clés
     words = re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ]{4,}", text.lower())
     freq: dict[str, int] = {}
     for w in words:
@@ -117,149 +102,179 @@ def extract_profile(cv_text: str) -> dict:
         freq[w] = freq.get(w, 0) + 1
 
     sorted_words = sorted(freq.items(), key=lambda x: x[1], reverse=True)
-    top_keywords = [w for w, c in sorted_words[:15]]
+    top_keywords = [w for w, c in sorted_words[:20]]
+
+    # 2) Titre(s) possible(s) depuis les lignes
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+    title_candidates: list[str] = []
+    title_keywords = [
+        "technicien", "technicienne", "agent", "agente", "analyste",
+        "ingénieur", "ingenieur", "développeur", "developpeur", "développeuse",
+        "assistant", "assistante", "conseiller", "conseillère",
+        "représentant", "representant", "superviseur", "gestionnaire",
+        "préparateur", "préparatrice", "caissier", "caissière",
+        "vendeur", "vendeuse", "chauffeur", "livreur", "magasinier",
+        "comptable", "infirmier", "infirmière", "administrateur",
+        "administratrice", "coordonnateur", "coordonnatrice"
+    ]
+
+    for line in lines:
+        lower = line.lower()
+        if any(k in lower for k in title_keywords):
+            if 4 <= len(line) <= 120:
+                title_candidates.append(line)
+
+    titles = list(dict.fromkeys(title_candidates))
+
+    # Si vraiment on n'a pas trouvé de titre, on construit un titre à partir des mots-clés
+    if not titles:
+        if len(top_keywords) >= 2:
+            main_title = f"{top_keywords[0].capitalize()} / {top_keywords[1].capitalize()}"
+        elif top_keywords:
+            main_title = top_keywords[0].capitalize()
+        else:
+            main_title = "Profil expérimenté"
+        titles = [main_title]
 
     return {"titles": titles, "keywords": top_keywords}
 
 
 def build_search_queries(profile: dict) -> List[str]:
     """
-    Construit des requêtes de recherche à partir des titres + mots-clés.
-    Ces requêtes sont génériques et marchent pour tout type de CV.
+    Construit des requêtes Indeed à partir des titres + mots-clés.
     """
     titles = profile["titles"]
     keywords = profile["keywords"]
 
     queries: List[str] = []
 
-    for title in titles[:3]:  # on prend 3 titres max
+    for title in titles[:3]:  # on prend max 3 titres
         base = "+".join(title.lower().split())
-        extra = "+".join(keywords[:5]) if keywords else ""
+        extra = "+".join(keywords[:3]) if keywords else ""
         if extra:
             queries.append(f"{base}+{extra}")
         else:
             queries.append(base)
 
-    # Fallback si jamais vide
     if not queries:
         queries = ["emploi+canada"]
 
     return queries
 
 
-# ---------- Génération d'offres = en réalité des recherches intelligentes ----------
+# ----------------- Scraping Indeed -----------------
 
-def fake_fetch_jobs(queries: List[str], profile: dict) -> List[JobOffer]:
+def fetch_indeed_jobs(query: str, max_results: int = 10) -> List[JobOffer]:
     """
-    IMPORTANT : ici on ne crée pas de "vraies" offres individuelles (on ne scrape pas les sites),
-    on crée des BLOCS DE RECHERCHE intelligents vers Indeed / LinkedIn / Glassdoor / Talent.
+    Va chercher de vraies offres sur Indeed (Canada) pour la requête donnée.
+    On parse le HTML : titre, entreprise, lieu, extrait, date relative.
+    """
+    url = f"https://ca.indeed.com/jobs?q={query}&sort=date"
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0 Safari/537.36"
+        ),
+        "Accept-Language": "fr-CA,fr;q=0.9,en;q=0.8",
+    }
 
-    Chaque JobOffer = une recherche pré-configurée basée sur ton CV.
-    Les vraies dates de publication sont visibles directement sur les sites eux-mêmes.
-    """
-    now = datetime.now(timezone.utc)
+    try:
+        resp = requests.get(url, headers=headers, timeout=10)
+    except Exception as e:
+        print("Erreur réseau Indeed:", e)
+        return []
+
+    if resp.status_code != 200:
+        print("Statut HTTP non 200 pour Indeed:", resp.status_code)
+        return []
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+    cards = soup.select("a.tapItem")
+
     offers: List[JobOffer] = []
 
-    main_title = profile["titles"][0] if profile["titles"] else "profil"
-    keywords_str = ", ".join(profile["keywords"][:6])
+    for card in cards[:max_results]:
+        # Titre
+        title_el = card.select_one("h2.jobTitle span")
+        if not title_el:
+            title_el = card.select_one("h2.jobTitle")
+        title = title_el.get_text(strip=True) if title_el else "Titre non disponible"
 
-    for q in queries:
-        # Indeed
+        # Entreprise
+        company_el = card.select_one("span.companyName")
+        company = company_el.get_text(strip=True) if company_el else "Employeur non précisé"
+
+        # Lieu
+        loc_el = card.select_one("div.companyLocation")
+        location = loc_el.get_text(strip=True) if loc_el else "Lieu non précisé"
+
+        # Snippet
+        snippet_el = card.select_one("div.job-snippet")
+        snippet = snippet_el.get_text(" ", strip=True) if snippet_el else "Description non disponible."
+
+        # Date relative (ex: "il y a 2 jours")
+        date_el = card.select_one("span.date")
+        date_txt = date_el.get_text(strip=True) if date_el else None
+
+        # Salaire si dispo
+        salary_el = card.select_one("div.metadata.salary-snippet-container")
+        salary_text = salary_el.get_text(" ", strip=True) if salary_el else None
+
+        # URL de l'offre
+        href = card.get("href", "")
+        job_url = href
+        if job_url.startswith("/"):
+            job_url = "https://ca.indeed.com" + job_url
+
         offers.append(JobOffer(
-            title=f"Recherche Indeed pour « {main_title} »",
-            company="Indeed",
-            location="Canada / Montréal et environs",
-            url=f"https://ca.indeed.com/jobs?q={q}",
-            source="Indeed - recherche",
-            match_score=0.90,
-            snippet=f"Résultats Indeed adaptés à ton CV (mots-clés : {keywords_str}).",
-            published_at=now.isoformat(),  # info technique seulement, non affichée dans l'UI
-            is_paid=True,
-            salary_text=None
-        ))
-        # LinkedIn
-        offers.append(JobOffer(
-            title=f"Recherche LinkedIn pour « {main_title} »",
-            company="LinkedIn Jobs",
-            location="Canada (hybride / télétravail inclus)",
-            url=f"https://www.linkedin.com/jobs/search/?keywords={q}",
-            source="LinkedIn Jobs - recherche",
-            match_score=0.88,
-            snippet=f"Résultats LinkedIn basés sur ton CV (mots-clés : {keywords_str}).",
-            published_at=now.isoformat(),
-            is_paid=True,
-            salary_text=None
-        ))
-        # Glassdoor
-        offers.append(JobOffer(
-            title=f"Recherche Glassdoor pour « {main_title} »",
-            company="Glassdoor",
-            location="Canada",
-            url=f"https://www.glassdoor.ca/Job/jobs.htm?sc.keyword={q}",
-            source="Glassdoor - recherche",
-            match_score=0.84,
-            snippet="Recherche Glassdoor adaptée à ton profil. Consulte chaque annonce pour vérifier salaire et conditions.",
-            published_at=now.isoformat(),
-            is_paid=True,
-            salary_text=None
-        ))
-        # Talent.com
-        offers.append(JobOffer(
-            title=f"Recherche Talent.com pour « {main_title} »",
-            company="Talent.com",
-            location="Canada",
-            url=f"https://www.talent.com/jobs?k={q}",
-            source="Talent.com - recherche",
-            match_score=0.82,
-            snippet="Résultats Talent.com basés sur ton CV pour différents employeurs.",
-            published_at=now.isoformat(),
-            is_paid=True,
-            salary_text=None
+            title=title,
+            company=company,
+            location=location,
+            url=job_url,
+            source="Indeed",
+            match_score=0.9,
+            snippet=snippet,
+            published_at=date_txt,
+            is_paid=True,  # on suppose payé, à vérifier dans l'annonce
+            salary_text=salary_text,
         ))
 
-    # Unicité
-    unique: dict[tuple[str, str, str], JobOffer] = {}
-    for o in offers:
-        key = (o.title, o.company, o.url)
-        if key not in unique:
-            unique[key] = o
-
-    # Tri par score
-    res = list(unique.values())
-    res.sort(key=lambda x: x.match_score, reverse=True)
-    return res
+    return offers
 
 
-def filter_recent(offers: List[JobOffer], recent_minutes: int) -> List[JobOffer]:
+def enrich_scores(offers: List[JobOffer], profile: dict) -> List[JobOffer]:
     """
-    On garde cette fonction pour compatibilité, mais attention :
-    comme chaque JobOffer représente une RECHERCHE et pas une annonce unique,
-    la notion de "fraîcheur" est une approximation.
-    Pour ne pas mentir, l'UI n'affiche plus ces dates.
+    On booste un peu les offres qui contiennent des mots-clés du CV dans le titre/snippet.
     """
-    if recent_minutes <= 0:
-        return offers
-    now = datetime.now(timezone.utc)
-    limit = now - timedelta(minutes=recent_minutes)
-    filtered = []
+    keywords = set(profile["keywords"])
+
     for o in offers:
-        try:
-            pub = datetime.fromisoformat(o.published_at) if o.published_at else None
-        except Exception:
-            pub = None
-        if pub is None or pub >= limit:
-            filtered.append(o)
-    return filtered
+        txt = (o.title + " " + o.snippet).lower()
+        bonus = 0.0
+        for kw in keywords:
+            if kw in txt:
+                bonus += 0.01
+        o.match_score = min(0.99, round(o.match_score + bonus, 2))
+
+    offers.sort(key=lambda x: x.match_score, reverse=True)
+    return offers
 
 
-# ---------- Endpoints ----------
+# ----------------- Endpoints -----------------
 
 @app.post("/api/match", response_model=List[JobOffer])
 async def match_jobs(
     cv: UploadFile = File(...),
     recent_minutes: int = 0,
-    only_paid: bool = False  # gardé pour compat avec l'UI, mais on ne filtre pas vraiment
+    only_paid: bool = False   # gardé pour compat UI
 ):
+    """
+    1. Lit le CV (PDF / DOCX / autres)
+    2. Extrait un "profil" (titres + mots-clés)
+    3. Construit plusieurs requêtes Indeed
+    4. Retourne de vraies offres Indeed avec leur titre / employeur / lieu / date
+    """
     if not cv.filename:
         raise HTTPException(status_code=400, detail="Aucun fichier reçu.")
 
@@ -269,11 +284,24 @@ async def match_jobs(
 
     profile = extract_profile(cv_text)
     queries = build_search_queries(profile)
-    offers = fake_fetch_jobs(queries, profile)
-    offers = filter_recent(offers, recent_minutes)
 
-    # pour l'instant toutes les recherches sont considérées comme "payées"
-    # -> les vraies infos de salaire sont sur les sites eux-mêmes
+    all_offers: List[JobOffer] = []
+    for q in queries:
+        all_offers.extend(fetch_indeed_jobs(q, max_results=7))  # ~7 par requête
+
+    # dédoublonnage
+    unique: dict[tuple[str, str, str], JobOffer] = {}
+    for o in all_offers:
+        key = (o.title, o.company, o.url)
+        if key not in unique:
+            unique[key] = o
+
+    offers = list(unique.values())
+    offers = enrich_scores(offers, profile)
+
+    # on peut limiter à 20 pour rester raisonnable
+    offers = offers[:20]
+
     return offers
 
 
@@ -285,9 +313,9 @@ async def contact_hr(req: ContactRequest):
     email_body = f"""
 Bonjour,
 
-Je vous contacte concernant le poste ou les opportunités associées à « {req.job_title} » au sein de {req.company}.
+Je vous contacte concernant le poste « {req.job_title} » au sein de {req.company}.
 
-Je possède une expérience pertinente et des compétences en lien avec ce type de poste.
+Mon profil et mon expérience sont étroitement liés à ce type de poste, comme détaillé dans mon CV.
 
 Résumé rapide de mon profil :
 {req.cv_summary}
