@@ -4,52 +4,43 @@ from pydantic import BaseModel
 from typing import List
 import io
 import re
-import requests
 
 from pdfminer.high_level import extract_text as pdf_extract_text
 from docx import Document
+import requests
+from bs4 import BeautifulSoup
 
-# ============================================================
-# CONFIG BACKEND
-# ============================================================
-
-# 👉 À REMPLACER avec ta vraie clé d'API d'un agrégateur de jobs
-JOB_API_KEY = "YOUR_API_KEY"
-
-# 👉 Exemple d'endpoint d'un agrégateur (à adapter à ton API réelle)
-JOB_API_URL = "https://example-job-aggregator.com/search"  # TODO: mettre l'URL réelle
-
-# ============================================================
-# FASTAPI APP
-# ============================================================
+# ---------------------------------------------------------
+# FastAPI app + CORS
+# ---------------------------------------------------------
 
 app = FastAPI(
     title="JobMatch Assistant Pro",
-    description="Analyse un CV et récupère des offres sur plusieurs sites d'emploi.",
+    description="Analyse un CV et trouve des offres sur plusieurs sites.",
     version="6.0.0"
 )
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # plus tard: restreindre à ton domaine Vercel
+    allow_origins=["*"],   # plus tard: restreindre à ton domaine Vercel
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ============================================================
-# MODELES
-# ============================================================
+# ---------------------------------------------------------
+# Modèles de données
+# ---------------------------------------------------------
 
 class JobOffer(BaseModel):
     title: str
     company: str
     location: str
     url: str
-    source: str           # Indeed / LinkedIn / Glassdoor / ...
-    match_score: float    # 0.0 -> 1.0
+    source: str
+    match_score: float
     snippet: str
-    published_at: str | None   # ex: "il y a 2 jours" ou "2025-11-23"
+    published_at: str | None
     is_paid: bool
     salary_text: str | None
 
@@ -63,9 +54,9 @@ class ContactRequest(BaseModel):
     cv_summary: str
 
 
-# ============================================================
-# UTILS CV
-# ============================================================
+# ---------------------------------------------------------
+# Utils CV
+# ---------------------------------------------------------
 
 STOPWORDS = {
     "je", "nous", "vous", "ils", "elles", "le", "la", "les", "des", "de", "du", "un", "une",
@@ -78,7 +69,7 @@ STOPWORDS = {
 
 def extract_text_from_upload(upload: UploadFile) -> str:
     """
-    Lis le CV (PDF / DOCX / DOC / TXT) et renvoie le texte brut.
+    Lit le CV (PDF, DOCX, DOC, TXT) et renvoie le texte.
     """
     content = upload.file.read()
     filename = (upload.filename or "").lower()
@@ -108,13 +99,13 @@ def extract_text_from_upload(upload: UploadFile) -> str:
 
 def extract_profile(cv_text: str) -> dict:
     """
-    Extrait un "profil" générique :
+    Extrait un 'profil' à partir du CV:
     - mots-clés fréquents
-    - tentative de titre de poste
+    - titre probable
     """
     text = cv_text
 
-    # 1) Mots-clés
+    # Mots-clés
     words = re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ]{4,}", text.lower())
     freq: dict[str, int] = {}
     for w in words:
@@ -123,9 +114,9 @@ def extract_profile(cv_text: str) -> dict:
         freq[w] = freq.get(w, 0) + 1
 
     sorted_words = sorted(freq.items(), key=lambda x: x[1], reverse=True)
-    top_keywords = [w for w, c in sorted_words[:20]]
+    top_keywords = [w for w, _ in sorted_words[:25]]
 
-    # 2) Titre(s)
+    # Titres possibles
     lines = [l.strip() for l in text.splitlines() if l.strip()]
     title_candidates: list[str] = []
     title_keywords = [
@@ -160,100 +151,187 @@ def extract_profile(cv_text: str) -> dict:
     return {"titles": titles, "keywords": top_keywords}
 
 
-def build_search_query(profile: dict) -> str:
+def build_search_queries(profile: dict) -> list[str]:
     """
-    Construit UNE requête globale à partir du titre + quelques mots-clés.
-    (On préfère UNE requête bien dense pour l'API d'agrégation.)
+    Construit 1 à 2 requêtes de recherche à partir du CV.
+    On reste court pour aller vite.
     """
-    title = profile["titles"][0] if profile["titles"] else "emploi"
-    words = profile["keywords"][:5]
-    base = "+".join(title.lower().split())
-    extra = "+".join(words) if words else ""
-    if extra:
-        return f"{base}+{extra}"
-    return base
+    titles = profile["titles"]
+    keywords = profile["keywords"]
+
+    queries: list[str] = []
+
+    if titles:
+        base = "+".join(titles[0].lower().split())
+        extra = "+".join(keywords[:3]) if keywords else ""
+        if extra:
+            queries.append(f"{base}+{extra}")
+        else:
+            queries.append(base)
+
+    if not queries:
+        queries = ["emploi+canada"]
+
+    return queries[:2]
 
 
-# ============================================================
-# FETCH JOBS VIA AGRÉGATEUR
-# ============================================================
+# ---------------------------------------------------------
+# Scrapers multi-sites (simplifiés)
+# ⚠️ Ça dépend de la structure HTML des sites.
+#    Si les sites changent, il faudra ajuster les sélecteurs.
+# ---------------------------------------------------------
 
-def fetch_jobs_from_aggregator(query: str, limit: int = 30) -> List[JobOffer]:
-    """
-    Appelle un agrégateur d'offres (multi-sites : Indeed, LinkedIn, Glassdoor, etc.)
-    et renvoie une liste d'offres normalisées.
-    ⚠ Tu dois adapter cette fonction au format réel de l'API que tu vas utiliser.
-    """
+def fetch_indeed_jobs(query: str, max_results: int = 10) -> List[JobOffer]:
+    url = f"https://ca.indeed.com/jobs?q={query}&sort=date"
     headers = {
-        "User-Agent": "JobMatchAssistant/1.0",
-        "Accept": "application/json",
-        # Ex: pour RapidAPI : "X-RapidAPI-Key": JOB_API_KEY,
-        #                     "X-RapidAPI-Host": "XXX.p.rapidapi.com",
-    }
-
-    params = {
-        "q": query,       # à adapter selon la doc de l'API
-        "country": "CA",  # cible Canada
-        "page": 1,
-        "limit": limit,
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0 Safari/537.36"
+        ),
+        "Accept-Language": "fr-CA,fr;q=0.9,en;q=0.8",
     }
 
     try:
-        resp = requests.get(JOB_API_URL, headers=headers, params=params, timeout=15)
+        resp = requests.get(url, headers=headers, timeout=10)
     except Exception as e:
-        print("Erreur réseau job API:", e)
+        print("Erreur réseau Indeed:", e)
         return []
 
     if resp.status_code != 200:
-        print("Statut HTTP non 200 job API:", resp.status_code, resp.text[:200])
+        print("Statut HTTP non 200 pour Indeed:", resp.status_code)
         return []
 
-    try:
-        data = resp.json()
-    except Exception as e:
-        print("Erreur parse JSON job API:", e)
-        return []
+    soup = BeautifulSoup(resp.text, "html.parser")
+    cards = soup.select("a.tapItem")
 
     offers: List[JobOffer] = []
 
-    # ⚠ ADAPTER CE MAPPING à la structure réelle du JSON renvoyé par ton API.
-    # Ici j'imagine un format type :
-    # {
-    #   "jobs": [
-    #     {
-    #       "title": "...",
-    #       "company": "...",
-    #       "location": "...",
-    #       "description": "...",
-    #       "url": "...",
-    #       "source": "indeed",
-    #       "posted_at": "...",
-    #       "salary": "...",
-    #     }, ...
-    #   ]
-    # }
-    jobs = data.get("jobs") or data.get("data") or []
-    for j in jobs[:limit]:
-        title = j.get("title") or "Titre non disponible"
-        company = j.get("company") or j.get("employer_name") or "Employeur non précisé"
-        location = j.get("location") or j.get("city") or "Lieu non précisé"
-        url = j.get("url") or j.get("job_url") or ""
-        source = j.get("source") or j.get("job_platform") or "Inconnu"
-        snippet = j.get("description") or j.get("snippet") or ""
-        posted = j.get("posted_at") or j.get("date_posted") or None
-        salary_text = j.get("salary") or j.get("salary_text") or None
+    for card in cards[:max_results]:
+        title_el = card.select_one("h2.jobTitle span") or card.select_one("h2.jobTitle")
+        company_el = card.select_one("span.companyName")
+        loc_el = card.select_one("div.companyLocation")
+        date_el = card.select_one("span.date")
+        snippet_el = card.select_one("div.job-snippet")
+        salary_el = card.select_one("div.metadata.salary-snippet-container")
+
+        title = title_el.get_text(strip=True) if title_el else "Titre non disponible"
+        company = company_el.get_text(strip=True) if company_el else "Employeur non précisé"
+        location = loc_el.get_text(strip=True) if loc_el else "Lieu non précisé"
+        date_txt = date_el.get_text(strip=True) if date_el else None
+        snippet = snippet_el.get_text(" ", strip=True) if snippet_el else ""
+        salary_text = salary_el.get_text(" ", strip=True) if salary_el else None
+
+        href = card.get("href", "")
+        job_url = "https://ca.indeed.com" + href if href.startswith("/") else href
 
         offers.append(JobOffer(
             title=title,
             company=company,
             location=location,
-            url=url,
-            source=source.capitalize(),
-            match_score=0.8,    # ajustable
+            url=job_url,
+            source="Indeed",
+            match_score=0.8,
             snippet=snippet[:300],
-            published_at=posted,
+            published_at=date_txt,
             is_paid=True,
-            salary_text=salary_text,
+            salary_text=salary_text
+        ))
+
+    return offers
+
+
+def fetch_jobbank_jobs(query: str, max_results: int = 8) -> List[JobOffer]:
+    url = f"https://www.jobbank.gc.ca/jobsearch/jobsearch?searchstring={query}"
+    headers = {"User-Agent": "Mozilla/5.0"}
+
+    try:
+        resp = requests.get(url, headers=headers, timeout=10)
+    except Exception as e:
+        print("Erreur réseau JobBank:", e)
+        return []
+
+    if resp.status_code != 200:
+        print("Statut HTTP non 200 pour JobBank:", resp.status_code)
+        return []
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+    cards = soup.select("article.resultJobItem")[:max_results]
+
+    offers: List[JobOffer] = []
+
+    for c in cards:
+        title_el = c.select_one("a.title")
+        company_el = c.select_one("li.business")
+        loc_el = c.select_one("li.location")
+        date_el = c.select_one("li.date")
+
+        title = title_el.get_text(strip=True) if title_el else "Titre non disponible"
+        company = company_el.get_text(strip=True) if company_el else "Employeur non précisé"
+        location = loc_el.get_text(strip=True) if loc_el else "Lieu non précisé"
+        date_txt = date_el.get_text(strip=True) if date_el else None
+
+        href = title_el["href"] if title_el and title_el.has_attr("href") else ""
+        job_url = "https://www.jobbank.gc.ca" + href if href.startswith("/") else href
+
+        offers.append(JobOffer(
+            title=title,
+            company=company,
+            location=location,
+            url=job_url,
+            source="JobBank",
+            match_score=0.7,
+            snippet="Offre trouvée sur JobBank Canada.",
+            published_at=date_txt,
+            is_paid=True,
+            salary_text=None
+        ))
+
+    return offers
+
+
+def fetch_talent_jobs(query: str, max_results: int = 8) -> List[JobOffer]:
+    url = f"https://ca.talent.com/jobs?k={query}&l=Canada"
+    headers = {"User-Agent": "Mozilla/5.0"}
+
+    try:
+        resp = requests.get(url, headers=headers, timeout=10)
+    except Exception as e:
+        print("Erreur réseau Talent:", e)
+        return []
+
+    if resp.status_code != 200:
+        print("Statut HTTP non 200 pour Talent.com:", resp.status_code)
+        return []
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+    cards = soup.select("div.card.card__job")[:max_results]
+
+    offers: List[JobOffer] = []
+
+    for c in cards:
+        title_el = c.select_one("h2.card__job-title")
+        company_el = c.select_one("div.card__job-empname-label")
+        loc_el = c.select_one("div.card__job-location-label")
+        link_el = c.select_one("a")
+
+        title = title_el.get_text(strip=True) if title_el else "Titre non disponible"
+        company = company_el.get_text(strip=True) if company_el else "Employeur non précisé"
+        location = loc_el.get_text(strip=True) if loc_el else "Lieu non précisé"
+        href = link_el["href"] if link_el and link_el.has_attr("href") else ""
+        job_url = href if href.startswith("http") else "https://ca.talent.com" + href
+
+        offers.append(JobOffer(
+            title=title,
+            company=company,
+            location=location,
+            url=job_url,
+            source="Talent.com",
+            match_score=0.7,
+            snippet="Offre trouvée sur Talent.com.",
+            published_at=None,
+            is_paid=True,
+            salary_text=None
         ))
 
     return offers
@@ -261,35 +339,35 @@ def fetch_jobs_from_aggregator(query: str, limit: int = 30) -> List[JobOffer]:
 
 def enrich_scores(offers: List[JobOffer], profile: dict) -> List[JobOffer]:
     """
-    Améliore un peu le score des offres qui contiennent les mots-clés du CV.
+    Boost les offres qui contiennent des mots-clés du CV.
     """
     keywords = set(profile["keywords"])
-
     for o in offers:
         txt = (o.title + " " + o.snippet).lower()
         bonus = 0.0
         for kw in keywords:
             if kw and kw in txt:
                 bonus += 0.01
+        if o.source == "Indeed":
+            bonus += 0.02
         o.match_score = min(0.99, round(o.match_score + bonus, 2))
 
-    offers.sort(key=lambda x: o.match_score, reverse=True)
+    offers.sort(key=lambda x: x.match_score, reverse=True)
     return offers
 
 
-# ============================================================
-# ENDPOINTS
-# ============================================================
+# ---------------------------------------------------------
+# Endpoints
+# ---------------------------------------------------------
 
 @app.post("/api/match", response_model=List[JobOffer])
 async def match_jobs(
     cv: UploadFile = File(...),
-    recent_minutes: int = 0,
-    only_paid: bool = False,
+    recent_minutes: int = 0,    # gardé pour compat front
+    only_paid: bool = False     # idem
 ):
     """
-    Analyse le CV et retourne une liste d'offres d'emploi (multi-plateformes)
-    via un agrégateur d'offres.
+    Analyse le CV et renvoie une liste d'offres multi-sites.
     """
     if not cv.filename:
         raise HTTPException(status_code=400, detail="Aucun fichier reçu.")
@@ -299,26 +377,40 @@ async def match_jobs(
         raise HTTPException(status_code=400, detail="Impossible de lire le contenu du CV.")
 
     profile = extract_profile(cv_text)
-    query = build_search_query(profile)
+    queries = build_search_queries(profile)
 
-    offers = fetch_jobs_from_aggregator(query, limit=30)
+    all_offers: List[JobOffer] = []
 
-    if not offers:
-        # fallback très simple : au cas où l'API renvoie rien
-        offers = []
+    for q in queries:
+        all_offers += fetch_indeed_jobs(q, max_results=10)
+        all_offers += fetch_jobbank_jobs(q, max_results=8)
+        all_offers += fetch_talent_jobs(q, max_results=8)
 
-    # filtrage salaire si tu veux (pour only_paid) → à adapter à ton API
+    # dédoublonnage
+    unique: dict[tuple[str, str, str, str], JobOffer] = {}
+    for o in all_offers:
+        key = (o.title, o.company, o.url, o.source)
+        if key not in unique:
+            unique[key] = o
+
+    offers = list(unique.values())
+    offers = enrich_scores(offers, profile)
+
+    # filtre offres avec salaire si besoin
     if only_paid:
         offers = [o for o in offers if o.salary_text]
 
-    # on garde max 30
-    return offers[:30]
+    # min 20 / max 40
+    if len(offers) < 20:
+        # on renvoie tout ce qu'on a
+        return offers
+    return offers[:40]
 
 
 @app.post("/api/contact-hr")
 async def contact_hr(req: ContactRequest):
     """
-    Génère un email à envoyer à HR.
+    Génère un email type à envoyer à HR.
     """
     if not req.hr_email:
         req.hr_email = "recrutement@" + req.company.replace(" ", "").lower() + ".com"
